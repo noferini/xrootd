@@ -89,6 +89,19 @@
 #include "XrdSfs/XrdSfsFlags.hh"
 #include "XrdSfs/XrdSfsInterface.hh"
 
+// Added by F. Noferini
+#include <sys/statfs.h>
+#include <sys/statvfs.h>
+#include <mntent.h>
+#include <fstab.h>
+#include <errno.h>
+#include <string.h>
+#include <unistd.h>
+#include <attr/xattr.h>
+
+#include <gpfs.h>
+// End F. Noferini added
+
 #ifdef AIX
 #include <sys/mode.h>
 #endif
@@ -479,6 +492,201 @@ int XrdOfsFile::open(const char          *path,      // In
    static const int crMask = (SFS_O_CREAT  | SFS_O_TRUNC);
    static const int opMask = (SFS_O_RDONLY | SFS_O_WRONLY | SFS_O_RDWR);
 
+   // Added by F. Noferini
+   char gpfslocalpath[MAXPATHLEN];
+   char s[MAXPATHLEN];
+   char atl[16], atf[16], atd[16], nowstr[16];
+   struct statfs fsbuf;
+   struct stat64 filebuf;
+   struct statvfs vbuf, sbuf;
+   struct mntent *ent;
+   FILE *mnttab;
+   
+   time_t now, errdate, lastrec, firstrec;
+   
+   const char *yamssConfigPath="/system/YAMSS_CONFIG";
+   const char *yamssDmRecallPath="/system/YAMSS_DMRECALL";
+   char hname[4096];
+   int fd;
+   int isNew=0;
+   
+#define XROOTD_TSM_RECALL_WAIT_TIME 20
+#define XROOTD_TSM_RECALL_SOFT_TIMEOUT 3600
+#define XROOTD_TSM_RECALL_HARD_TIMEOUT 86400
+   
+   int retcNameConv;
+   XrdOfsOss->Lfn2Pfn(path, gpfslocalpath, MAXPATHLEN, retcNameConv);
+   
+   /* check if filesystem is GPFS */
+   if(::statfs(gpfslocalpath, &fsbuf)) goto xrdstd;
+   if(fsbuf.f_type!=GPFS_SUPER_MAGIC) goto xrdstd;
+   /* it's a GPFS! Go ahead */
+   
+   /* check if file is on disk */
+   if(::stat64(gpfslocalpath, &filebuf)) goto xrdstd;
+   
+   /* We discover the file locality by checking the number of
+      blocks allocated on disk. This works if files do not have holes... */
+   if((filebuf.st_blocks*512)>=filebuf.st_size) {
+     if(::removexattr(gpfslocalpath, "user.xrootd.frec")) {
+       cerr << "File is on disk, but cannot remove user.xrootd.frec for file " << gpfslocalpath << endl;
+       cerr << "Continuing anyway" << endl;
+     }
+     if(::removexattr(gpfslocalpath, "user.xrootd.lrec")) {
+       cerr << "File is on disk, but cannot remove user.xrootd.lrec for file " << gpfslocalpath << endl;
+       cerr << "Continuing anyway" << endl;
+     }
+     goto xrdstd;
+   }
+   /* File is migrated, maybe... go ahead */
+   
+   /* save current time */
+   now=::time(NULL);
+   sprintf(nowstr,"%d",int(now));
+   
+   /* check if first recall and last recall extended attributes exist */
+   int rc;
+   if((rc=::getxattr(gpfslocalpath, "user.xrootd.frec", atf, 16))<0 && errno==ENOATTR) {
+     if(::setxattr(gpfslocalpath, "user.xrootd.frec", nowstr, 10, 0)) {
+       cerr << "Cannot set user.xrootd.frec for file " << gpfslocalpath << endl;
+       return SFS_ERROR;
+     }
+     isNew=1;
+   } else if(rc<0) {
+     cerr << "Cannot check if user.xrootd.frec exists for file " << gpfslocalpath << endl;
+     return SFS_ERROR;
+   }
+   if((rc=::getxattr(gpfslocalpath, "user.xrootd.lrec", atl, 16))<0 && errno==ENOATTR) {
+     if(::setxattr(gpfslocalpath, "user.xrootd.lrec", nowstr, 10, 0)) {
+       cerr << "Cannot set user.xrootd.lrec for file " << gpfslocalpath << endl;
+       return SFS_ERROR;
+     }
+     isNew=1;
+   } else if(rc<0) {
+     cerr << "Cannot check if user.xrootd.lrec exists for file " << gpfslocalpath << endl;
+     return SFS_ERROR;
+   }
+   
+   /* get first recall and last recall time */
+   if(::getxattr(gpfslocalpath, "user.xrootd.frec", atf, 16)<0) {
+     /* this can just be a race condition between clients accessing the same file at the same moment. Return wait and try later. In 
+	chaos we trust! */
+     return XROOTD_TSM_RECALL_WAIT_TIME;
+   }
+   if(::getxattr(gpfslocalpath, "user.xrootd.lrec", atl, 16)<0) {
+     /* this can just be a race condition between clients accessing the same file at the same moment. Return wait and try later. In 
+	chaos we trust! */
+     return XROOTD_TSM_RECALL_WAIT_TIME;
+   }
+   
+   /* Check if last recall time minus now exceeds 2*SOFT_TIMEOUT */
+   atl[10]=0;
+   lastrec=strtol(atl,NULL,10);
+   if( (now-lastrec) > 2*XROOTD_TSM_RECALL_SOFT_TIMEOUT ) {
+     /* most probably something went wrong in previous recalls of this file. Restore attributes*/
+     if(::setxattr(gpfslocalpath, "user.xrootd.frec", nowstr, 10, 0)) {
+       cerr << "Cannot set user.xrootd.frec for file " << gpfslocalpath << endl;
+       return SFS_ERROR;
+     }
+     if(::setxattr(gpfslocalpath, "user.xrootd.lrec", nowstr, 10, 0)) {
+       cerr << "Cannot set user.xrootd.lrec for file " << gpfslocalpath << endl;
+       return SFS_ERROR;
+     }
+   }
+   
+   /* Get error attribute if existing */
+   if(::getxattr(gpfslocalpath, "user.TSMErrD", atd, 16)>0) {
+     atd[10]=0;
+     /* File has an error condition set */
+     errdate=strtol(atd,NULL,10);
+     if(lastrec<errdate) {
+       cerr << "I/O error from GEMSS: cannot recall file " << gpfslocalpath << " to disk" << endl;
+       return SFS_ERROR;
+     }
+   }
+   
+   /* check if hard timeout has been exceeded */
+   atf[10]=0;
+   firstrec=strtol(atf,NULL,10);
+   if( (now-firstrec) > XROOTD_TSM_RECALL_HARD_TIMEOUT ) {
+     cerr << "Cannot recall file " << gpfslocalpath << " to disk after " << XROOTD_TSM_RECALL_HARD_TIMEOUT << " seconds. Giving up" << endl;
+     return SFS_ERROR;
+   }
+   
+   /* check if soft timeout has been exceeded */
+   if( (now-lastrec) > XROOTD_TSM_RECALL_SOFT_TIMEOUT ) {
+     /* Restore last recall attribute */
+     if(::setxattr(gpfslocalpath, "user.xrootd.lrec", nowstr, 10, 0)) {
+       cerr << "Cannot set user.xrootd.lrec for file " << gpfslocalpath << endl;
+       return SFS_ERROR;
+     }
+   } else if(!isNew) {
+     /* File is not yet ready. Return wait to the client */
+     return XROOTD_TSM_RECALL_WAIT_TIME;
+   }
+   
+   /* Submit the file for batch recall */
+   
+   if(::statvfs(gpfslocalpath, &vbuf)) {
+     cerr << "Cannot statvfs " << gpfslocalpath << endl;
+     return SFS_ERROR;
+   }
+   /* look for the mount point where the file resides */
+   mnttab = ::fopen("/etc/mtab", "r");
+   ent=::getmntent(mnttab);
+   while(ent) {
+     if(!::statvfs(ent->mnt_dir, &sbuf)) {
+       if(vbuf.f_fsid==sbuf.f_fsid) {
+	 break;
+       }
+     }
+     ent = ::getmntent(mnttab);
+   }
+   ::fclose(mnttab);
+   
+   if(!ent) {
+     cerr << "Something weird, cannot find mountpoint for file " << gpfslocalpath << endl;
+     return SFS_ERROR;
+   }
+   
+   ::sprintf(s,"%s%s",ent->mnt_dir,yamssConfigPath);
+   if(::access(s, F_OK)) {
+     /* if yamss config cannot be accessed, we assume that the file system is not yamss-managed */
+     goto xrdstd;
+   }
+   
+   /* get host name */
+   if(::gethostname(hname,4096)) {
+     cerr << "Something weird, cannot get hostname for file " << gpfslocalpath << endl;
+     return SFS_ERROR;
+   }
+   
+   /* generate temporary file with unique name containing the file to be recalled */
+   ::sprintf(s,"%s%s/%s.%d.XXXXXXXX",ent->mnt_dir,yamssDmRecallPath,hname,getpid());
+   if((fd=::mkstemp(s))<0) {
+     cerr << "Something weird, cannot generate temporary file " << s << " for file " << gpfslocalpath << endl;
+     return SFS_ERROR;
+   }
+   
+   /* write file name to recall into temporary file */
+   if(::write(fd,gpfslocalpath,strlen(gpfslocalpath))<0) {
+     cerr << "Cannot write into temporary file " << s << " for file " << gpfslocalpath << endl;
+     ::close(fd);
+     if(::unlink(s)<0) {
+       cerr << "Cannot delete temporary file " << s << " for file " << gpfslocalpath << endl;
+     }
+     return SFS_ERROR;
+   }
+   
+   ::close(fd);
+   
+   /* File recall has been submitted. Return wait to the client */
+   return XROOTD_TSM_RECALL_WAIT_TIME;
+   
+   /* Ordinary part of the method. File is on disk and can be accessed */
+ xrdstd:
+   // End F. Noferini added
+
    struct OpenHelper
          {const char   *Path;
           XrdOfsHandle *hP;
@@ -791,6 +999,33 @@ int XrdOfsFile::close()  // In
   Output:   Returns SFS_OK upon success and SFS_ERROR upon failure.
 */
 {
+  // added by F. Noferini
+  char localpath[16384];
+  int retcNameConv;
+  XrdOfsOss->Lfn2Pfn(FName(), localpath, 16384, retcNameConv);
+  
+  char md5sum[34];
+
+  if((::getxattr(localpath, "user.md5sum", md5sum, 33))<0 && errno==ENOATTR) {
+    char comando[100000];
+    sprintf(comando,"md5sum %s",localpath);
+    FILE *lsofFile_p = popen(comando, "r");
+    
+    if (!lsofFile_p)
+    {
+      return SFS_ERROR;
+    }
+
+    char buffer[33];
+    /* char *line_p = */ fgets(buffer, sizeof(buffer), lsofFile_p);
+    sprintf(md5sum,"%s",buffer);
+    pclose(lsofFile_p);
+    
+    ::setxattr(localpath, "user.md5sum", md5sum, 32, 0);
+    
+  }
+  // end part added by F. Noferini
+  
    EPNAME("close");
 
    class  CloseFH : public XrdOfsHanCB
